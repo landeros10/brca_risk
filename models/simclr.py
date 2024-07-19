@@ -20,12 +20,11 @@ from tensorflow.keras.initializers import Constant, HeNormal
 from tensorflow.keras.regularizers import L2
 from tensorflow.keras.layers import Dense, BatchNormalization, Activation, PReLU
 from tensorflow.linalg import matmul
-
 import logging
 
 from ..scripts.util import gpu_cross_replica_concat
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 LARGE = 1e9
 
 resnet_selector = {
