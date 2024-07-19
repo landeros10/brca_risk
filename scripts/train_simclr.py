@@ -12,41 +12,65 @@ Massachusetts Institute of Technology
 Main SimCLR Training Pipeline
 '''
 import tensorflow as tf
-from tensorflow.linalg import matmul
+from tensorflow.linalg import matmul # type: ignore
 import logging
 import argparse
+from os.path import join
 
-from ..models.simclr import SimCLRKerasModel
-from .util import build_optimizer, build_simclr_loss
-from .train_simclr import build_model
+from models.simclr import SimCLRKerasModel
+from scripts.util import build_optimizer, build_dataset, _parse_function, _sample_from_tfrecord, _augment
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
-# TODO
-# double check default values
-parser = argparse.ArgumentParser()
+homeDir = '/home/ubuntu/notebooks/cpc_hist'
+resourceDir = join(homeDir, "resources")
+DATA_DIR = join(resourceDir, "tfrecords")
 
+parser = argparse.ArgumentParser()
 # Model Definitions
 parser.add_argument('--input_s', type=int, default=256, help='Size of the image input')
-parser.add_argument('--resnet_depth', type=int, default=50, help='Depth of the ResNet model')
+parser.add_argument('--resnet_depth', type=int, default=101, help='Depth of the ResNet model')
 parser.add_argument('--weight_init', type=str, default='imagenet', help='Type of weight initialization')
 parser.add_argument('--resnet_pooling', type=str, default='avg', help='Type of pooling in ResNet')
 parser.add_argument('--proj_out_dim', type=int, default=128, help='Output dimension after projection')
 parser.add_argument('--proj_n_layers', type=int, default=2, help='Number of hidden layers')
 
-parser.add_argument('--bs', type=int, default=256, help='Batch size')
-parser.add_argument('--optimizer', type=str, default='adam', help='Type of optimizer')
-parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
-parser.add_argument('--warmup_steps', type=int, default=0, help='Number of warmup steps')
-parser.add_argument('--clip_norm', type=float, default=0.0, help='Clip norm value')
+parser.add_argument('--bs', type=int, default=128, help='Batch size')
+parser.add_argument('--optimizer', type=str, default='lars', help='Type of optimizer')
+parser.add_argument('--learning_rate', type=float, default=0.3, help='Learning rate')
+parser.add_argument('--warmup_steps', type=int, default=500, help='Number of warmup steps')
+parser.add_argument('--clip_norm', type=float, default=-1.0, help='Clip norm value')
 
 parser.add_argument('--cpc_temperature', type=float, default=0.1, help='CPC temperature')
-parser.add_argument('--l2_coeff', type=float, default=0.0, help='L2 regularization coefficient')
-
+parser.add_argument('--l2_coeff', type=float, default=1e-6, help='L2 regularization coefficient')
 parser.add_argument('--cpc_perturbation', type=float, default=0.1, help='CPC perturbation')
 parser.add_argument('--cpc_loss_coeff', type=float, default=1.0, help='CPC loss coefficient')
 
+# Dataset Definitions
+parser.add_argument('--dataset_dir', type=str, default=DATA_DIR, help='Path to the dataset shards')
+parser.add_argument('--max_ex', type=int, default=10000, help='Number of examples per shard')
+
+# Data Augmentation Parameters
+parser.add_argument('--blur_radius', type=float, default=10.0, help='Blur radius')
+parser.add_argument('--blur_p', type=float, default=0.5, help='Blur probability')
+parser.add_argument('--crop_frac', type=float, default=0.5, help='Crop fraction')
+parser.add_argument('--rotate_limit', type=float, default=15, help='Rotate limit')
+
 FLAGS, _ = parser.parse_known_args()
+
+def prepare_dataset(ds, base_path, tile_size, batch_size, aug_params, num_parallel_calls=-1, preFetch=-1, train_size=-1):
+    if train_size > 0:
+        ds = ds.take(train_size)
+
+    num_gpus = len(tf.config.list_physical_devices('GPU'))
+
+    ds = ds.shuffle(1000)
+    ds = ds.map(lambda proto: _parse_function(proto, batched=False, base_path=base_path), num_parallel_calls=num_parallel_calls)
+    ds = ds.map(lambda pf: _sample_from_tfrecord(pf, tile_size, batched=False), num_parallel_calls=6)
+    ds = ds.batch(batch_size)
+    ds = ds.map(lambda im: _augment(im, tile_size, batch_size, num_gpus, **aug_params), num_parallel_calls=num_parallel_calls)
+    ds = ds.prefetch(buffer_size=preFetch)
+    return ds
 
 
 def build_simclr_loss(hp, model, strategy, eps, cpc_loss_coeff, l2_coeff):
@@ -131,17 +155,6 @@ class ContrastiveEntropy(tf.keras.metrics.Mean):
         return super().update_state(entropy_con, sample_weight)
 
 
-class L2Metric(tf.keras.metrics.Mean):
-    def __init__(self, name='l2_loss', **kwargs):
-        super(L2Metric, self).__init__(**kwargs)
-
-    def update_state(self, values, sample_weight=None):
-        probabilities = tf.nn.softmax(values)
-        entropy_con = -tf.reduce_mean(
-            tf.reduce_sum(probabilities * tf.math.log(probabilities + 1e-8), -1))
-        return super().update_state(entropy_con, sample_weight)
-
-
 def build_model(hp):
     """
     Hyper-parameters:
@@ -178,15 +191,35 @@ def build_model(hp):
     return model
 
 
-def train_model(hp, train_dataset, val_dataset, train_steps, steps_per_epoch):
+def train_model(hp, train_dataset, train_steps, steps_per_epoch):
     # Training Strategy
     strategy = hp.get('strategy', tf.distribute.get_strategy())
 
     with strategy.scope():
         model = build_model(hp)
 
-        # Optimizer
+        # Dataset Parameters
         bs = hp.get('bs', FLAGS.bs)
+        train_size = hp.get('train_size', -1)
+
+        #  Data augment parameters
+        aug_params = {
+            "blur_radius": hp.get("blur_radius", FLAGS.blur_radius),
+            "blur_p": hp.get("blur_p", FLAGS.blur_p),
+            "crop_frac": hp.get("crop_frac", FLAGS.crop_frac),
+            "rotate_limit": hp.get("rotate_limit", FLAGS.rotate_limit),
+        }
+        train_dataset = prepare_dataset(
+            train_dataset,
+            FLAGS.input_s,
+            bs,
+            aug_params,
+            num_parallel_calls=-1,
+            preFetch=-1,
+            train_size=train_size
+        )
+
+        # Optimizer Parameters
         optimizer_type = hp.get("optimizer", FLAGS.optimizer)
         lr = hp.get("learning_rate", FLAGS.learning_rate)
         warmup_steps = hp.get("warmup_steps", FLAGS.warmup_steps)
@@ -223,7 +256,6 @@ def train_model(hp, train_dataset, val_dataset, train_steps, steps_per_epoch):
 
         history = model.fit(
             train_dataset,
-            validation_data=val_dataset,
             epochs=num_epochs,
             steps_per_epoch=train_steps
         )
@@ -233,8 +265,14 @@ def train_model(hp, train_dataset, val_dataset, train_steps, steps_per_epoch):
 
 if __name__ == "__main__":
     # Set up your train and validation datasets
-    train_dataset = ...
-    val_dataset = ...
+    ds = build_dataset(
+        dataset_dir=FLAGS.dataset_dir,
+        patch_size=FLAGS.input_s,
+        shuffle=True,
+        n_parallel=-1,
+        max_ex=FLAGS.max_ex,
+        return_len=False
+    )
     
     # Set up hyperparameters
     hp = {

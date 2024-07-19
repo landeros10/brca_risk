@@ -22,7 +22,7 @@ from tensorflow.keras.layers import Dense, BatchNormalization, Activation, PReLU
 from tensorflow.linalg import matmul
 import logging
 
-from ..scripts.util import gpu_cross_replica_concat
+from scripts.util import gpu_cross_replica_concat
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 LARGE = 1e9
@@ -157,8 +157,8 @@ class SimCLRKerasModel(tf.keras.Model):
     def contrastive_to_logits(self, proj):
         tau = self.cpc_temperature
 
-        bs = tf.shape(x)[0] // 2
-        x = tf.math.l2_normalize(x, -1)
+        bs = tf.shape(proj)[0] // 2
+        x = tf.math.l2_normalize(proj, -1)
         x1, x2 = tf.split(x, 2, 0)
 
         x1_large = gpu_cross_replica_concat(x1, self.strategy)
