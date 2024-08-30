@@ -68,7 +68,7 @@ def prepare_dataset(ds, base_path, tile_size, batch_size, aug_params, num_parall
     ds = ds.map(lambda proto: _parse_function(proto, batched=False, base_path=base_path), num_parallel_calls=num_parallel_calls)
     ds = ds.map(lambda pf: _sample_from_tfrecord(pf, tile_size, batched=False), num_parallel_calls=6)
     ds = ds.batch(batch_size)
-    ds = ds.map(lambda im: _augment(im, tile_size, batch_size, num_gpus, **aug_params), num_parallel_calls=num_parallel_calls)
+    ds = ds.map(lambda im: _augment(im, tile_size, batch_size, num_gpus, aug_params), num_parallel_calls=num_parallel_calls)
     ds = ds.prefetch(buffer_size=preFetch)
     return ds
 

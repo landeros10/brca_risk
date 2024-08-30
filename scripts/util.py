@@ -64,7 +64,7 @@ def get_ds_length(ds_files, max_ex):
     return ((N-1) * max_ex) + last_ex
 
 
-def build_dataset(dataset_dir, patch_size, n_parallel=-1, shuffle=False, max_ex=1e5, return_len=False):
+def build_dataset(dataset_dir, patch_size, n_parallel=-1, shuffle=False, max_ex=1e5, return_len=False, verbose=False):
     """ Converts dataset into a distributed dataset according to
     distribute_datasets_from_function """
     logging.info("Using Dataset located at %s", dataset_dir)
@@ -86,12 +86,14 @@ def build_dataset(dataset_dir, patch_size, n_parallel=-1, shuffle=False, max_ex=
         # lambda x: build_dataset_shard(x, patch_size, n_parallel),
         num_parallel_calls=n_parallel,
         deterministic=(not shuffle))
-    logging.info("Data File Path : {}".format(dataset_dir))
-    logging.info("Patch Size: {}".format(patch_size))
-    logging.info("Total Shards: {}".format(len(shards)))
+    if verbose:
+      logging.info("Data File Path : {}".format(dataset_dir))
+      logging.info("Patch Size: {}".format(patch_size))
+      logging.info("Total Shards: {}".format(len(shards)))
 
     total_examples = get_ds_length(shards, max_ex)
-    logging.info("Total Samples: {:.2f}M\n\n".format(total_examples / 1e6))
+    if verbose:
+      logging.info("Total Samples: {:.2f}M\n\n".format(total_examples / 1e6))
     if return_len:
         return ds, int(total_examples)
     return ds
@@ -349,38 +351,84 @@ def read_slide_batch(files, xs, ys, in_ss, out_s, normalize=False):
     return batch_images
 
 
-def _augment(x, tile_size, bs, num_gpus,
-             crop_frac=0.9, rotate_limit=10, blur_radius=5, blur_p=0.25,
-             train=True):
-    """ Performs stochastic augmentaiton steps.
+def _augment(x, tile_size, bs, num_gpus, aug_params, train=True):
+    """ 
+    Performs stochastic augmentation steps on input data.
 
-    Performs augmentation steps, using the following probability params:
+    Parameters:
+    - x: Input tensor to augment.
+    - tile_size: Size of the tiles to crop to.
+    - bs: Batch size for processing.
+    - num_gpus: Number of GPUs available, affects batching.
+    - aug_params: Dictionary of augmentation parameters.
+    - train: If True, apply training augmentations.
     """
     out_size = (bs * 2, tile_size, tile_size, 3)
+    
+    # Convert aug_params dictionary values to a list of tensors
+    aug_params_list = [
+        tf.constant(aug_params.get('h_flip_p', 0.5), dtype=tf.float32),
+        tf.constant(aug_params.get('v_flip_p', 0.5), dtype=tf.float32),
+        tf.constant(aug_params.get('rotate_p', 1.0), dtype=tf.float32),
+        tf.constant(aug_params.get('crop_frac', 0.9), dtype=tf.float32),
+        tf.constant(aug_params.get('elastic_alpha', 50), dtype=tf.float32),
+        tf.constant(aug_params.get('elastic_sigma', 50), dtype=tf.float32),
+        tf.constant(aug_params.get('elastic_alpha_affine', 15), dtype=tf.float32),
+        tf.constant(aug_params.get('elastic_p', 0.80), dtype=tf.float32),
+        tf.constant(aug_params.get('blur_radius', 5), dtype=tf.float32),
+        tf.constant(aug_params.get('blur_p', 0.25), dtype=tf.float32),
+        tf.constant(aug_params.get('rotate_limit', 10), dtype=tf.float32)
+    ]    
+    # Use *aug_params_list to unpack the list of tensors as individual arguments
     x = tf.numpy_function(
         func=augmentor_batch,
-        inp=[x, tile_size, bs, num_gpus, crop_frac, rotate_limit, blur_radius, blur_p],
-        Tout=tf.uint8)
+        inp=[x, tile_size, bs, num_gpus, *aug_params_list],
+        Tout=tf.uint8
+    )
+    
     x.set_shape(out_size)
     x = tf.cast(x, tf.float32) / 255.0
     return x
 
+def augmentor_batch(batch_images, tile_size, bs, num_gpus, 
+                    h_flip_p=0.5, v_flip_p=0.5, rotate_p=1.0, crop_frac=0.9, 
+                    elastic_alpha=50, elastic_sigma=50, elastic_alpha_affine=15, elastic_p=0.80, 
+                    blur_radius=5, blur_p=0.25, rotate_limit=10):
+    """
+    Augments a batch of images with various transformations using provided parameters.
 
-def augmentor_batch(batch_images, tile_size, bs, num_gpus, crop_frac, rotate_limit, blur_radius, blur_p):
+    Parameters:
+    - batch_images: The batch of images to augment.
+    - tile_size: Target size for each cropped image tile.
+    - bs: Batch size for processing.
+    - num_gpus: Number of GPUs for adjusting batch division.
+    - h_flip_p: Probability of applying horizontal flip (default: 0.5).
+    - v_flip_p: Probability of applying vertical flip (default: 0.5).
+    - rotate_p: Probability of applying random rotation of 90 degrees (default: 1.0).
+    - crop_frac: Fraction of image to randomly crop and resize (default: 0.9).
+    - elastic_alpha: Alpha value for elastic transformation (default: 50).
+    - elastic_sigma: Sigma value for elastic transformation (default: 50).
+    - elastic_alpha_affine: Alpha affine for elastic transformation (default: 15).
+    - elastic_p: Probability of applying elastic transformation (default: 0.80).
+    - blur_radius: Radius for the blur effect (default: 5).
+    - blur_p: Probability of applying blur (default: 0.25).
+    - rotate_limit: Maximum degrees for random rotation (default: 10).
+    """
     avg_pixel = batch_images.mean(axis=(0, 1, 2)).astype(int).tolist()
 
+    # Define the augmentation pipeline using Albumentations library
     transform = A.Compose([
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.5),
-        A.RandomRotate90(p=1.0),
+        A.HorizontalFlip(h_flip_p),
+        A.VerticalFlip(v_flip_p),
+        A.RandomRotate90(rotate_p),
         A.RandomResizedCrop(tile_size, tile_size, scale=(crop_frac, 1.0), ratio=(1.0, 1.0), p=1.0),
         A.Lambda(image=stain_augmentor_wrapper),
-        A.ElasticTransform(alpha=50, sigma=50, alpha_affine=15, p=0.80),
-        A.Defocus(radius=(1, blur_radius), alias_blur=0.0, p=blur_p),
-        A.ShiftScaleRotate(scale_limit=0.25, rotate_limit=(-rotate_limit, rotate_limit), border_mode=0, value=avg_pixel, p=1.0),
+        A.ElasticTransform(alpha=int(elastic_alpha), sigma=int(elastic_sigma), alpha_affine=int(elastic_alpha_affine), p=elastic_p),
+        A.Defocus(radius=(1, int(blur_radius)), alias_blur=0.0, p=blur_p),
+        A.ShiftScaleRotate(scale_limit=0.25, rotate_limit=(-int(rotate_limit), int(rotate_limit)), border_mode=0, value=avg_pixel, p=1.0),
     ])
-
-    # num_gpus = max(num_gpus, 1)
+    
+    # Apply augmentation transformations
     small_bs = bs // num_gpus
     augmented_images = np.zeros((bs * 2, tile_size, tile_size, 3), dtype=batch_images.dtype)
     for i in range(bs):
